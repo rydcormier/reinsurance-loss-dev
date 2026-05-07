@@ -1,0 +1,1 @@
+"""Loss triangle ingestion package."""
