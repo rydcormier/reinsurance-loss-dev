@@ -55,19 +55,56 @@ def parse_csv(filepath: Path | str) -> LossTriangle:
     Raises:
         FileNotFoundError: If file does not exist
         ValueError: If CSV format is invalid
-
-    TODO:
-        - Read CSV with pandas
-        - Extract origin_years from first column
-        - Extract development_periods from header
-        - Parse cumulative losses matrix
-        - Calculate incremental losses (cumulative[t] - cumulative[t-1])
-        - Handle missing values and padding
-        - Extract premium row if present
-        - Return populated LossTriangle
     """
-    raise NotImplementedError("parse_csv stub — implement CSV parsing logic")
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"CSV file not found: {filepath}")
 
+    df = pd.read_csv(filepath, index_col=0)
+    if df.empty:
+        raise ValueError("CSV file is empty or has no data columns")
+
+    # Extract premium row if present (case-insensitive match)
+    premium: Optional[np.ndarray] = None
+    premium_mask = df.index.astype(str).str.lower() == "premium"
+    if premium_mask.any():
+        premium = df.loc[premium_mask].iloc[0].values.astype(float)
+        df = df.loc[~premium_mask]
+
+    # Parse origin years and development periods
+    try:
+        origin_years = [int(y) for y in df.index]
+    except ValueError as e:
+        raise ValueError(f"Non-integer origin year in index: {e}") from e
+
+    try:
+        development_periods = [int(c) for c in df.columns]
+    except ValueError as e:
+        raise ValueError(f"Non-integer development period in header: {e}") from e
+
+    cumulative = df.values.astype(float)  # NaN for missing upper-right cells
+
+    n_rows, n_cols = cumulative.shape
+    incremental = np.full_like(cumulative, np.nan)
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if np.isnan(cumulative[i, j]):
+                continue
+            if j == 0:
+                incremental[i, j] = cumulative[i, j]
+            elif not np.isnan(cumulative[i, j - 1]):
+                incremental[i, j] = cumulative[i, j] - cumulative[i, j - 1]
+
+    return LossTriangle(
+        line_of_business=filepath.stem,
+        origin_years=origin_years,
+        development_periods=development_periods,
+        incremental_losses=incremental,
+        cumulative_losses=cumulative,
+        premium=premium,
+        metadata={"source": str(filepath)},
+    )
+    
 
 def parse_excel(filepath: Path | str, sheet_name: str = "Triangle") -> LossTriangle:
     """
@@ -90,15 +127,64 @@ def parse_excel(filepath: Path | str, sheet_name: str = "Triangle") -> LossTrian
     Raises:
         FileNotFoundError: If file does not exist
         ValueError: If Excel format is invalid
-
-    TODO:
-        - Read Excel with pandas.read_excel()
-        - Extract origin_years, development_periods, cumulative losses
-        - Calculate incremental losses
-        - Handle premium sheet or embedded row
-        - Return populated LossTriangle
     """
-    raise NotImplementedError("parse_excel stub — implement Excel parsing logic")
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Excel file not found: {filepath}")
+
+    try:
+        df = pd.read_excel(filepath, sheet_name=sheet_name, index_col=0)
+    except Exception as e:
+        raise ValueError(f"Failed to read sheet '{sheet_name}': {e}") from e
+
+    if df.empty:
+        raise ValueError("Excel sheet is empty or has no data columns")
+
+    # Try dedicated Premium sheet first, then fall back to embedded row
+    premium: Optional[np.ndarray] = None
+    xl = pd.ExcelFile(filepath)
+    if "Premium" in xl.sheet_names:
+        prem_df = pd.read_excel(filepath, sheet_name="Premium", index_col=0)
+        if not prem_df.empty:
+            premium = prem_df.iloc[0].values.astype(float)
+    else:
+        premium_mask = df.index.astype(str).str.lower() == "premium"
+        if premium_mask.any():
+            premium = df.loc[premium_mask].iloc[0].values.astype(float)
+            df = df.loc[~premium_mask]
+
+    try:
+        origin_years = [int(y) for y in df.index]
+    except ValueError as e:
+        raise ValueError(f"Non-integer origin year in index: {e}") from e
+
+    try:
+        development_periods = [int(c) for c in df.columns]
+    except ValueError as e:
+        raise ValueError(f"Non-integer development period in header: {e}") from e
+
+    cumulative = df.values.astype(float)
+
+    n_rows, n_cols = cumulative.shape
+    incremental = np.full_like(cumulative, np.nan)
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if np.isnan(cumulative[i, j]):
+                continue
+            if j == 0:
+                incremental[i, j] = cumulative[i, j]
+            elif not np.isnan(cumulative[i, j - 1]):
+                incremental[i, j] = cumulative[i, j] - cumulative[i, j - 1]
+
+    return LossTriangle(
+        line_of_business=filepath.stem,
+        origin_years=origin_years,
+        development_periods=development_periods,
+        incremental_losses=incremental,
+        cumulative_losses=cumulative,
+        premium=premium,
+        metadata={"source": str(filepath), "sheet": sheet_name},
+    )
 
 
 def validate(triangle: LossTriangle) -> List[str]:
@@ -117,16 +203,44 @@ def validate(triangle: LossTriangle) -> List[str]:
 
     Returns:
         List of validation error messages (empty list if valid)
-
-    TODO:
-        - Check for NaN values in cumulative_losses and incremental_losses
-        - Check for negative losses
-        - Check monotonicity: cumulative[i,j] >= cumulative[i,j-1] for all i,j
-        - Check origin_years and development_periods are sorted
-        - Return list of error strings describing any issues found
-        - Example: ["Negative loss at origin_year=2015, dev_period=24", ...]
     """
-    raise NotImplementedError("validate stub — implement validation logic")
+    errors: List[str] = []
+
+    if triangle.origin_years != sorted(triangle.origin_years):
+        errors.append("origin_years are not in increasing order")
+
+    if triangle.development_periods != sorted(triangle.development_periods):
+        errors.append("development_periods are not in increasing order")
+
+    cum = triangle.cumulative_losses
+    inc = triangle.incremental_losses
+
+    for i, oy in enumerate(triangle.origin_years):
+        for j, dp in enumerate(triangle.development_periods):
+            if np.isnan(cum[i, j]):
+                continue
+
+            if np.isnan(inc[i, j]):
+                errors.append(
+                    f"NaN incremental loss at origin_year={oy}, dev_period={dp}"
+                )
+
+            if cum[i, j] < 0:
+                errors.append(
+                    f"Negative cumulative loss at origin_year={oy}, dev_period={dp}"
+                )
+
+            if not np.isnan(inc[i, j]) and inc[i, j] < 0:
+                errors.append(
+                    f"Negative incremental loss at origin_year={oy}, dev_period={dp}"
+                )
+
+            if j > 0 and not np.isnan(cum[i, j - 1]) and cum[i, j] < cum[i, j - 1]:
+                errors.append(
+                    f"Non-monotonic cumulative loss at origin_year={oy}, dev_period={dp}"
+                )
+
+    return errors
 
 
 def to_dataframe(triangle: LossTriangle) -> pd.DataFrame:
@@ -148,15 +262,20 @@ def to_dataframe(triangle: LossTriangle) -> pd.DataFrame:
 
     Returns:
         DataFrame in long format with one row per cell
-
-    TODO:
-        - Create lists of origin_year, development_period, incremental_loss, cumulative_loss
-        - Iterate over triangle.incremental_losses (and cumulative_losses)
-        - For each (i,j), append row: {origin_year, dev_period, incremental, cumulative}
-        - Include line_of_business for each row
-        - Return pd.DataFrame with these columns
     """
-    raise NotImplementedError("to_dataframe stub — implement dataframe conversion logic")
+    rows = []
+    for i, oy in enumerate(triangle.origin_years):
+        for j, dp in enumerate(triangle.development_periods):
+            rows.append(
+                {
+                    "origin_year": oy,
+                    "development_period": dp,
+                    "incremental_loss": triangle.incremental_losses[i, j],
+                    "cumulative_loss": triangle.cumulative_losses[i, j],
+                    "line_of_business": triangle.line_of_business,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def __init_submodule__():
